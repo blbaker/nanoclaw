@@ -48,6 +48,9 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
+  // Basenames of files staged in {ipcDir}/{group}/files/ — the host
+  // resolves them to absolute paths and attaches to channel.sendMessage.
+  files?: string[];
   newSessionId?: string;
   error?: string;
 }

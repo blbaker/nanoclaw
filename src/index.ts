@@ -47,7 +47,10 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import {
+  resolveGroupFolderPath,
+  resolveGroupFilesPath,
+} from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -285,17 +288,54 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
-    if (result.result) {
+    // Resolve auto-staged image attachments (basenames in result.files
+    // → absolute host paths in {ipcDir}/{folder}/files/).
+    const resolvedFiles: string[] = [];
+    if (Array.isArray(result.files) && result.files.length > 0) {
+      const filesDir = resolveGroupFilesPath(group.folder);
+      for (const f of result.files) {
+        if (typeof f !== 'string') continue;
+        const safe = path.basename(f);
+        const fullPath = path.join(filesDir, safe);
+        if (fs.existsSync(fullPath)) {
+          resolvedFiles.push(fullPath);
+        } else {
+          logger.warn(
+            { group: group.name, file: safe },
+            'Streamed attachment missing on host',
+          );
+        }
+      }
+    }
+
+    if (result.result || resolvedFiles.length > 0) {
       const raw =
         typeof result.result === 'string'
           ? result.result
-          : JSON.stringify(result.result);
+          : result.result
+            ? JSON.stringify(result.result)
+            : '';
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
+      logger.info(
+        { group: group.name, files: resolvedFiles.length },
+        `Agent output: ${raw.length} chars`,
+      );
+      if (text || resolvedFiles.length > 0) {
+        await channel.sendMessage(
+          chatJid,
+          text,
+          resolvedFiles.length > 0 ? resolvedFiles : undefined,
+        );
         outputSentToUser = true;
+        // Cleanup staged files after delivery
+        for (const fp of resolvedFiles) {
+          try {
+            fs.unlinkSync(fp);
+          } catch {
+            /* ignore */
+          }
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();

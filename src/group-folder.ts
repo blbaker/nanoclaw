@@ -42,3 +42,7 @@ export function resolveGroupIpcPath(folder: string): string {
   ensureWithinBase(ipcBaseDir, ipcPath);
   return ipcPath;
 }
+
+export function resolveGroupFilesPath(folder: string): string {
+  return path.join(resolveGroupIpcPath(folder), 'files');
+}

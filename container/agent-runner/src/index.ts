@@ -38,6 +38,11 @@ interface ContainerInput {
 interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
+  // Basenames of files staged in /workspace/ipc/files/ for the host to
+  // attach to the next channel.sendMessage call. Set when the agent's tool
+  // results contain image content blocks (e.g. playwright screenshots) or
+  // when the agent explicitly stages files via send_message.
+  files?: string[];
   newSessionId?: string;
   error?: string;
 }
@@ -411,6 +416,9 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  // Image attachments staged from tool results during the current result cycle.
+  // Cleared after each `result` message is emitted to the host.
+  const pendingToolFiles: string[] = [];
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -619,18 +627,86 @@ async function runQuery(
       );
     }
 
+    // Detect image content blocks in tool results (e.g. playwright
+    // screenshots, image-generation tools). The SDK wraps tool_result blocks
+    // inside user-role messages. We decode any base64 image to disk under
+    // /workspace/ipc/files/ so the host can attach them on the next sendMessage.
+    if (message.type === 'user') {
+      const userMsg = message as {
+        message?: { content?: unknown };
+      };
+      const content = userMsg.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (
+            !block ||
+            typeof block !== 'object' ||
+            (block as { type?: string }).type !== 'tool_result'
+          )
+            continue;
+          const toolResultContent = (
+            block as { content?: unknown }
+          ).content;
+          if (!Array.isArray(toolResultContent)) continue;
+          for (const inner of toolResultContent) {
+            if (
+              !inner ||
+              typeof inner !== 'object' ||
+              (inner as { type?: string }).type !== 'image'
+            )
+              continue;
+            const src = (inner as { source?: { type?: string; data?: string; media_type?: string } })
+              .source;
+            if (
+              !src ||
+              src.type !== 'base64' ||
+              typeof src.data !== 'string'
+            )
+              continue;
+            try {
+              const filesDir = '/workspace/ipc/files';
+              fs.mkdirSync(filesDir, { recursive: true });
+              const ext = (src.media_type || 'image/png').split('/')[1] || 'png';
+              const basename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-tool.${ext}`;
+              const fullPath = path.join(filesDir, basename);
+              fs.writeFileSync(fullPath, Buffer.from(src.data, 'base64'));
+              const stat = fs.statSync(fullPath);
+              if (stat.size > 25 * 1024 * 1024) {
+                fs.unlinkSync(fullPath);
+                log(
+                  `Tool image dropped (>25MB): ${stat.size} bytes`,
+                );
+                continue;
+              }
+              pendingToolFiles.push(basename);
+              log(
+                `Staged tool image: ${basename} (${stat.size} bytes, ${src.media_type || 'unknown'})`,
+              );
+            } catch (err) {
+              log(
+                `Failed to stage tool image: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+      }
+    }
+
     if (message.type === 'result') {
       resultCount++;
       const textResult =
         'result' in message ? (message as { result?: string }).result : null;
       log(
-        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
+        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}${pendingToolFiles.length ? ` files=${pendingToolFiles.length}` : ''}`,
       );
       writeOutput({
         status: 'success',
         result: textResult || null,
+        files: pendingToolFiles.length > 0 ? [...pendingToolFiles] : undefined,
         newSessionId,
       });
+      // Clear staged files after emitting — the host attaches them once.
+      pendingToolFiles.length = 0;
     }
   }
 
