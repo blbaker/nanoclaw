@@ -318,11 +318,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             : '';
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+
+      // NO_REPLY sentinel — when a scheduled task or persona returns the
+      // literal text "NO_REPLY" (or just "no reply"), suppress the message
+      // entirely. This is the OpenClaw-era convention used by cron jobs to
+      // mean "I checked, nothing to report — say nothing".
+      const isNoReply = /^NO[_-]REPLY\s*$/i.test(text);
+
       logger.info(
-        { group: group.name, files: resolvedFiles.length },
+        {
+          group: group.name,
+          files: resolvedFiles.length,
+          suppressed: isNoReply,
+        },
         `Agent output: ${raw.length} chars`,
       );
-      if (text || resolvedFiles.length > 0) {
+
+      if (isNoReply && resolvedFiles.length === 0) {
+        // Mark as "sent" so we don't roll back the cursor and re-process
+        outputSentToUser = true;
+      } else if (text || resolvedFiles.length > 0) {
         await channel.sendMessage(
           chatJid,
           text,

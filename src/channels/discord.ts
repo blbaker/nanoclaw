@@ -279,9 +279,7 @@ export class DiscordChannel implements Channel {
       }
       const textChannel = channel as TextChannel;
 
-      const legend = options
-        .map((o) => `${o.emoji} ${o.label}`)
-        .join('\n');
+      const legend = options.map((o) => `${o.emoji} ${o.label}`).join('\n');
       const sent = await textChannel.send(
         `${question}\n\n${legend}\n\n_Reply within ${Math.round(timeoutMs / 1000)}s, or I'll proceed with the default._`,
       );
