@@ -15,6 +15,7 @@ const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const FILES_DIR = path.join(IPC_DIR, 'files');
+const ASKS_DIR = path.join(IPC_DIR, 'asks');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -981,6 +982,112 @@ server.tool(
             `Usage over ${days} days (${totals.length} sessions):\n\n` +
             lines.join('\n') +
             `\n\nTOTAL  in:${grand.input.toLocaleString()} out:${grand.output.toLocaleString()} cache:${(grand.cacheRead + grand.cacheWrite).toLocaleString()} ~$${cost(grand).toFixed(2)}\n\n(Pricing is approximate Opus 4.6 rates. Actual cost varies by model.)`,
+        },
+      ],
+    };
+  },
+);
+
+// ask_user — interactive multiple-choice prompt to the human via Discord
+// reactions. Useful when the agent is about to do something with a few
+// distinct paths and wants the user to pick. Falls back to a default
+// (caller-supplied) on timeout or when the channel doesn't support it.
+server.tool(
+  'ask_user',
+  `Ask Baker a multiple-choice question via Discord reactions and wait for his answer. The user can tap an emoji to choose. Returns the chosen option's \`value\`, or \`timeout\` if no response within \`timeoutSeconds\` (default 300 = 5 minutes), or \`unsupported\` if the channel can't handle interactive prompts. Use this when you're about to do something with 2-4 distinct paths and want the user to pick. Pass a sensible default in your prompt logic — if the answer comes back as 'timeout' or 'unsupported', use the default.`,
+  {
+    question: z
+      .string()
+      .describe('The question to ask. Be concise — 1-2 sentences.'),
+    options: z
+      .array(
+        z.object({
+          emoji: z
+            .string()
+            .describe(
+              'A single Unicode emoji the user will tap. Examples: 👍, ⚡, 🔍, ✅, ❌, 🛑, 🚀, 💭. Must be unique within the question.',
+            ),
+          label: z
+            .string()
+            .describe('Short human-readable label shown next to the emoji.'),
+          value: z
+            .string()
+            .describe(
+              'Machine-readable value returned to you when this option is chosen. Use snake_case.',
+            ),
+        }),
+      )
+      .min(2)
+      .max(8)
+      .describe('Between 2 and 8 options.'),
+    timeoutSeconds: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'How long to wait for an answer (default 300, max 900). On timeout, returns "timeout".',
+      ),
+  },
+  async (args) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const reqPath = path.join(ASKS_DIR, `${id}.json`);
+    const answerPath = path.join(ASKS_DIR, `${id}-answer.json`);
+    const timeoutMs = Math.min(
+      Math.max((args.timeoutSeconds ?? 300) * 1000, 5000),
+      900000,
+    );
+
+    fs.mkdirSync(ASKS_DIR, { recursive: true });
+    fs.writeFileSync(
+      reqPath,
+      JSON.stringify({
+        type: 'ask_user',
+        chatJid,
+        groupFolder,
+        question: args.question,
+        options: args.options,
+        timeoutMs,
+        timestamp: new Date().toISOString(),
+      }),
+    );
+
+    // Poll for the answer file. Add 10s grace beyond the host's timeout.
+    const deadline = Date.now() + timeoutMs + 10000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(answerPath)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(answerPath, 'utf-8')) as {
+            answer?: string;
+            reason?: string;
+          };
+          // Cleanup
+          try {
+            fs.unlinkSync(answerPath);
+          } catch {
+            /* ignore */
+          }
+          const answer = data.answer || 'timeout';
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `User answered: ${answer}${data.reason ? ` (${data.reason})` : ''}`,
+              },
+            ],
+          };
+        } catch {
+          // Partial write; keep polling.
+        }
+      }
+      // Sleep 500ms between polls
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: 'User answered: timeout',
         },
       ],
     };

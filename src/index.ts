@@ -6,6 +6,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 import {
   ASSISTANT_NAME,
   DEFAULT_TRIGGER,
+  DISCORD_OWNER_ID,
   getTriggerPattern,
   GROUPS_DIR,
   IDLE_TIMEOUT,
@@ -753,10 +754,28 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: (jid, text, files) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      return channel.sendMessage(jid, text, files);
+    },
+    askUser: async (jid, question, options, timeoutMs) => {
+      const channel = findChannel(channels, jid);
+      if (!channel || !channel.askUser) return 'unsupported';
+      if (!DISCORD_OWNER_ID) {
+        logger.warn(
+          { jid },
+          'askUser: DISCORD_OWNER_ID not set — cannot determine who can answer',
+        );
+        return 'error';
+      }
+      return channel.askUser(
+        jid,
+        question,
+        options,
+        DISCORD_OWNER_ID,
+        timeoutMs,
+      );
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

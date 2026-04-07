@@ -10,6 +10,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_HAS_OWN_NUMBER',
   'ONECLI_URL',
   'TZ',
+  'DISCORD_OWNER_ID',
 ]);
 
 export const ASSISTANT_NAME =
@@ -52,6 +53,10 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   10,
 ); // 10MB default
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
+// Discord user ID of the owner — the only person whose reactions count
+// for ask_user prompts. Required when interactive prompts are used.
+export const DISCORD_OWNER_ID =
+  process.env.DISCORD_OWNER_ID || envConfig.DISCORD_OWNER_ID || '';
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,

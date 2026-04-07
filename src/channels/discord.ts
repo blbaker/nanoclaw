@@ -42,6 +42,8 @@ export class DiscordChannel implements Channel {
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildMessageReactions,
+        GatewayIntentBits.DirectMessageReactions,
       ],
     });
 
@@ -243,6 +245,91 @@ export class DiscordChannel implements Channel {
       );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
+    }
+  }
+
+  /**
+   * Ask the user a multiple-choice question via Discord reactions.
+   * Posts the question, pre-reacts each option emoji, then waits for
+   * the user (matching senderUserId) to react with one of them, or for
+   * the timeout to elapse.
+   *
+   * Returns the selected option's `value` field, or 'timeout', or 'error'.
+   */
+  async askUser(
+    jid: string,
+    question: string,
+    options: Array<{ emoji: string; label: string; value: string }>,
+    senderUserId: string,
+    timeoutMs: number,
+  ): Promise<string> {
+    if (!this.client) {
+      logger.warn('Discord client not initialized for askUser');
+      return 'error';
+    }
+    if (options.length === 0 || options.length > 10) {
+      logger.warn({ count: options.length }, 'askUser: invalid options count');
+      return 'error';
+    }
+    try {
+      const channelId = jid.replace(/^dc:/, '');
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !('send' in channel)) {
+        return 'error';
+      }
+      const textChannel = channel as TextChannel;
+
+      const legend = options
+        .map((o) => `${o.emoji} ${o.label}`)
+        .join('\n');
+      const sent = await textChannel.send(
+        `${question}\n\n${legend}\n\n_Reply within ${Math.round(timeoutMs / 1000)}s, or I'll proceed with the default._`,
+      );
+
+      // Pre-react with each option emoji so user just taps
+      for (const o of options) {
+        try {
+          await sent.react(o.emoji);
+        } catch (err) {
+          logger.warn({ emoji: o.emoji, err }, 'askUser: failed to pre-react');
+        }
+      }
+
+      // Wait for the user's reaction
+      return await new Promise<string>((resolve) => {
+        const finished = { done: false };
+        const finish = (result: string) => {
+          if (finished.done) return;
+          finished.done = true;
+          this.client?.off(Events.MessageReactionAdd, listener);
+          clearTimeout(timer);
+          resolve(result);
+        };
+
+        const listener = async (
+          reaction: { message: { id: string }; emoji: { name: string | null } },
+          user: { id: string; bot: boolean },
+        ) => {
+          if (user.bot) return;
+          if (user.id !== senderUserId) return;
+          if (reaction.message.id !== sent.id) return;
+          const emojiName = reaction.emoji.name;
+          if (!emojiName) return;
+          const match = options.find((o) => o.emoji === emojiName);
+          if (match) {
+            finish(match.value);
+          }
+        };
+
+        const timer = setTimeout(() => finish('timeout'), timeoutMs);
+        this.client?.on(
+          Events.MessageReactionAdd,
+          listener as Parameters<Client['on']>[1],
+        );
+      });
+    } catch (err) {
+      logger.error({ jid, err }, 'askUser failed');
+      return 'error';
     }
   }
 

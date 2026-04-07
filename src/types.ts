@@ -98,6 +98,18 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: ask the user a multiple-choice question via reactions or
+  // platform-equivalent interactive UI. Returns the chosen option's
+  // `value` field, or 'timeout' if no response within the deadline,
+  // or 'error' on transport failure. Channels that don't support
+  // interactive prompts can omit this — callers must handle absence.
+  askUser?(
+    jid: string,
+    question: string,
+    options: Array<{ emoji: string; label: string; value: string }>,
+    senderUserId: string,
+    timeoutMs: number,
+  ): Promise<string>;
 }
 
 // Callback type that channels use to deliver inbound messages

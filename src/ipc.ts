@@ -12,6 +12,12 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string, files?: string[]) => Promise<void>;
+  askUser?: (
+    jid: string,
+    question: string,
+    options: Array<{ emoji: string; label: string; value: string }>,
+    timeoutMs: number,
+  ) => Promise<string>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -149,6 +155,132 @@ export function startIpcWatcher(deps: IpcDeps): void {
         logger.error(
           { err, sourceGroup },
           'Error reading IPC messages directory',
+        );
+      }
+
+      // Process ask_user requests from this group's IPC directory.
+      // The container writes /workspace/ipc/asks/{id}.json describing the
+      // question + options + timeout, then polls for {id}-answer.json.
+      // We call channel.askUser (Discord reactions) and write the answer back.
+      const asksDir = path.join(ipcBaseDir, sourceGroup, 'asks');
+      try {
+        if (fs.existsSync(asksDir)) {
+          const askFiles = fs
+            .readdirSync(asksDir)
+            .filter((f) => f.endsWith('.json') && !f.endsWith('-answer.json'));
+          for (const file of askFiles) {
+            const filePath = path.join(asksDir, file);
+            const id = file.replace(/\.json$/, '');
+            const answerPath = path.join(asksDir, `${id}-answer.json`);
+            // Skip if we've already started handling it (answer file exists)
+            if (fs.existsSync(answerPath)) continue;
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              if (
+                data.type !== 'ask_user' ||
+                !data.chatJid ||
+                !data.question ||
+                !Array.isArray(data.options)
+              ) {
+                fs.unlinkSync(filePath);
+                continue;
+              }
+              // Authorization: same rules as send_message — main can ask in
+              // any chat, persona groups can only ask in their own.
+              const targetGroup = registeredGroups[data.chatJid];
+              if (
+                !isMain &&
+                (!targetGroup || targetGroup.folder !== sourceGroup)
+              ) {
+                fs.writeFileSync(
+                  answerPath,
+                  JSON.stringify({
+                    answer: 'error',
+                    reason: 'unauthorized',
+                  }),
+                );
+                fs.unlinkSync(filePath);
+                continue;
+              }
+              if (!deps.askUser) {
+                // Channel doesn't support interactive prompts — fall through
+                // immediately so the agent uses its default.
+                fs.writeFileSync(
+                  answerPath,
+                  JSON.stringify({ answer: 'unsupported' }),
+                );
+                fs.unlinkSync(filePath);
+                continue;
+              }
+              // Mark in-flight so we don't double-process during the wait.
+              fs.writeFileSync(
+                answerPath + '.pending',
+                JSON.stringify({ startedAt: Date.now() }),
+              );
+              fs.unlinkSync(filePath);
+              // Fire-and-forget — when the reaction (or timeout) lands,
+              // write the answer file. The container is polling for it.
+              const timeoutMs = Math.min(
+                Math.max(Number(data.timeoutMs) || 300000, 5000),
+                900000,
+              );
+              const options = data.options as Array<{
+                emoji: string;
+                label: string;
+                value: string;
+              }>;
+              deps
+                .askUser(data.chatJid, data.question, options, timeoutMs)
+                .then((answer) => {
+                  fs.writeFileSync(
+                    answerPath,
+                    JSON.stringify({ answer, finishedAt: Date.now() }),
+                  );
+                  try {
+                    fs.unlinkSync(answerPath + '.pending');
+                  } catch {
+                    /* ignore */
+                  }
+                  logger.info(
+                    {
+                      sourceGroup,
+                      chatJid: data.chatJid,
+                      answer,
+                    },
+                    'ask_user resolved',
+                  );
+                })
+                .catch((err) => {
+                  fs.writeFileSync(
+                    answerPath,
+                    JSON.stringify({
+                      answer: 'error',
+                      reason: err instanceof Error ? err.message : String(err),
+                    }),
+                  );
+                  try {
+                    fs.unlinkSync(answerPath + '.pending');
+                  } catch {
+                    /* ignore */
+                  }
+                });
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC ask',
+              );
+              try {
+                fs.unlinkSync(filePath);
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC asks directory',
         );
       }
 
