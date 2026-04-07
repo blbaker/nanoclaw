@@ -439,13 +439,25 @@ async function runQuery(
   // Lets each persona group declare its own model, effort, and extra MCP
   // servers without code changes. The file is optional; missing keys fall
   // back to the global defaults below.
+  //
+  // MCP server entries support either stdio (command/args/env) or http/sse
+  // transport (type/url/headers). Env and header values may reference
+  // ${VAR_NAME} which is replaced from the container's process.env.
+  type StdioMcpDef = {
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+  };
+  type HttpMcpDef = {
+    type: 'http' | 'sse';
+    url: string;
+    headers?: Record<string, string>;
+  };
+  type AnyMcpDef = StdioMcpDef | HttpMcpDef;
   type GroupConfig = {
     model?: string;
     maxThinkingTokens?: number;
-    mcpServers?: Record<
-      string,
-      { command: string; args?: string[]; env?: Record<string, string> }
-    >;
+    mcpServers?: Record<string, AnyMcpDef>;
   };
   let groupConfig: GroupConfig = {};
   const groupConfigPath = '/workspace/group/.claude/nanoclaw.json';
@@ -462,13 +474,18 @@ async function runQuery(
     }
   }
 
+  // Resolve ${VAR_NAME} references against the container's env.
+  const expandVars = (s: string): string =>
+    s.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_m, key) =>
+      process.env[key] !== undefined ? process.env[key]! : '',
+    );
+
   // Optional Notion MCP server — only enabled if NOTION_API_KEY is present in
   // the container env (injected by OneCLI or passed through from .env).
   const notionApiKey = process.env.NOTION_API_KEY;
-  const extraMcpServers: Record<
-    string,
-    { command: string; args: string[]; env: Record<string, string> }
-  > = {};
+  // Use the SDK's mcpServers schema directly so we can mix stdio + http.
+  // (SDK accepts either form per-entry.)
+  const extraMcpServers: Record<string, unknown> = {};
   if (notionApiKey) {
     extraMcpServers.notion = {
       command: 'npx',
@@ -478,22 +495,30 @@ async function runQuery(
     log('Notion MCP server enabled');
   }
   // Merge per-group MCP servers — group config wins on name conflict.
-  // Substitute env var references in `env` values: ${VAR_NAME} → process.env[VAR_NAME].
   if (groupConfig.mcpServers) {
     for (const [name, def] of Object.entries(groupConfig.mcpServers)) {
-      const resolvedEnv: Record<string, string> = {};
-      for (const [k, v] of Object.entries(def.env || {})) {
-        if (typeof v === 'string') {
-          resolvedEnv[k] = v.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_m, key) =>
-            process.env[key] !== undefined ? process.env[key]! : '',
-          );
+      if ('type' in def && (def.type === 'http' || def.type === 'sse')) {
+        const resolvedHeaders: Record<string, string> = {};
+        for (const [k, v] of Object.entries(def.headers || {})) {
+          resolvedHeaders[k] = expandVars(v);
         }
+        extraMcpServers[name] = {
+          type: def.type,
+          url: expandVars(def.url),
+          headers: resolvedHeaders,
+        };
+      } else {
+        const stdioDef = def as StdioMcpDef;
+        const resolvedEnv: Record<string, string> = {};
+        for (const [k, v] of Object.entries(stdioDef.env || {})) {
+          if (typeof v === 'string') resolvedEnv[k] = expandVars(v);
+        }
+        extraMcpServers[name] = {
+          command: stdioDef.command,
+          args: stdioDef.args || [],
+          env: resolvedEnv,
+        };
       }
-      extraMcpServers[name] = {
-        command: def.command,
-        args: def.args || [],
-        env: resolvedEnv,
-      };
     }
     log(
       `Merged ${Object.keys(groupConfig.mcpServers).length} per-group MCP servers`,
@@ -539,6 +564,8 @@ async function runQuery(
         'mcp__notion__*',
         'mcp__github__*',
         'mcp__playwright__*',
+        'mcp__gcal__*',
+        'mcp__memgraph__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
