@@ -435,14 +435,40 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // ----- Per-group config from /workspace/group/.claude/nanoclaw.json -----
+  // Lets each persona group declare its own model, effort, and extra MCP
+  // servers without code changes. The file is optional; missing keys fall
+  // back to the global defaults below.
+  type GroupConfig = {
+    model?: string;
+    maxThinkingTokens?: number;
+    mcpServers?: Record<
+      string,
+      { command: string; args?: string[]; env?: Record<string, string> }
+    >;
+  };
+  let groupConfig: GroupConfig = {};
+  const groupConfigPath = '/workspace/group/.claude/nanoclaw.json';
+  if (fs.existsSync(groupConfigPath)) {
+    try {
+      groupConfig = JSON.parse(fs.readFileSync(groupConfigPath, 'utf-8'));
+      log(
+        `Loaded per-group config: model=${groupConfig.model || 'default'} mcpServers=${Object.keys(groupConfig.mcpServers || {}).join(',') || 'none'}`,
+      );
+    } catch (err) {
+      log(
+        `Failed to parse /workspace/group/.claude/nanoclaw.json: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   // Optional Notion MCP server — only enabled if NOTION_API_KEY is present in
   // the container env (injected by OneCLI or passed through from .env).
   const notionApiKey = process.env.NOTION_API_KEY;
-  const extraMcpServers: Record<string, {
-    command: string;
-    args: string[];
-    env: Record<string, string>;
-  }> = {};
+  const extraMcpServers: Record<
+    string,
+    { command: string; args: string[]; env: Record<string, string> }
+  > = {};
   if (notionApiKey) {
     extraMcpServers.notion = {
       command: 'npx',
@@ -451,12 +477,34 @@ async function runQuery(
     };
     log('Notion MCP server enabled');
   }
+  // Merge per-group MCP servers — group config wins on name conflict.
+  // Substitute env var references in `env` values: ${VAR_NAME} → process.env[VAR_NAME].
+  if (groupConfig.mcpServers) {
+    for (const [name, def] of Object.entries(groupConfig.mcpServers)) {
+      const resolvedEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(def.env || {})) {
+        if (typeof v === 'string') {
+          resolvedEnv[k] = v.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_m, key) =>
+            process.env[key] !== undefined ? process.env[key]! : '',
+          );
+        }
+      }
+      extraMcpServers[name] = {
+        command: def.command,
+        args: def.args || [],
+        env: resolvedEnv,
+      };
+    }
+    log(
+      `Merged ${Object.keys(groupConfig.mcpServers).length} per-group MCP servers`,
+    );
+  }
 
   for await (const message of query({
     prompt: stream,
     options: {
-      model: 'claude-opus-4-6',
-      maxThinkingTokens: 10000,
+      model: groupConfig.model || 'claude-opus-4-6',
+      maxThinkingTokens: groupConfig.maxThinkingTokens ?? 10000,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -489,6 +537,8 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__notion__*',
+        'mcp__github__*',
+        'mcp__playwright__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',

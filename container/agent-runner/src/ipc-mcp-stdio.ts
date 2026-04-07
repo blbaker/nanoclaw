@@ -503,6 +503,438 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+// memory_search — hybrid keyword + semantic search over the OpenClaw memory
+// archive at /workspace/group/openclaw-workspace/memory.sqlite (60 files,
+// 239 chunks). Three modes:
+//   - "fts" (default): FTS5 keyword search. Fast, no extension needed.
+//   - "semantic": Embeds the query via Ollama (nomic-embed-text at OLLAMA_URL),
+//     runs sqlite-vec KNN over chunks_vec_vector_chunks00. Best for fuzzy
+//     conceptual recall ("what did I say about ADHD time anchors").
+//   - "hybrid": runs both, deduplicates by chunk id, ranks semantic first.
+async function embedQueryViaOllama(query: string): Promise<number[] | null> {
+  const ollamaUrl =
+    process.env.OLLAMA_URL || 'http://192.168.1.115:11434';
+  const url = `${ollamaUrl.replace(/\/$/, '')}/api/embeddings`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'nomic-embed-text', prompt: query }),
+      // 5s soft timeout via AbortController
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { embedding?: number[] };
+    return j.embedding || null;
+  } catch {
+    return null;
+  }
+}
+
+server.tool(
+  'memory_search',
+  `Search the OpenClaw memory archive (60 files, 239 chunks: daily logs, instincts, swarm personas, MEMORY.md). Use this BEFORE answering memory-dependent questions. Modes: "fts" (keyword, default, fast, no Ollama), "semantic" (vector via Ollama nomic-embed-text), "hybrid" (both). Returns ranked matches with path, line range, snippet.`,
+  {
+    query: z
+      .string()
+      .describe(
+        'Search query. For mode=fts: FTS5 syntax (AND, OR, NEAR, "phrase", prefix*). For semantic/hybrid: natural language.',
+      ),
+    mode: z
+      .enum(['fts', 'semantic', 'hybrid'])
+      .optional()
+      .describe('Search mode. Default: fts.'),
+    limit: z
+      .number()
+      .int()
+      .optional()
+      .describe('Max results (default 8, max 25).'),
+  },
+  async (args) => {
+    const candidates = [
+      '/workspace/group/openclaw-workspace/memory.sqlite',
+      '/workspace/extra/openclaw-workspace/memory.sqlite',
+    ];
+    const dbPath = candidates.find((p) => fs.existsSync(p));
+    if (!dbPath) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'memory_search: openclaw memory archive not found.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const limit = Math.min(Math.max(args.limit ?? 8, 1), 25);
+    const mode = args.mode ?? 'fts';
+
+    const Database = (await import('better-sqlite3')).default;
+    const sqliteVec = await import('sqlite-vec');
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+
+    type Hit = {
+      path: string;
+      start_line: number;
+      end_line: number;
+      snippet: string;
+      score: number;
+      source: 'fts' | 'semantic';
+    };
+
+    const hits: Hit[] = [];
+
+    try {
+      // ----- FTS path -----
+      if (mode === 'fts' || mode === 'hybrid') {
+        try {
+          const safe = args.query.replace(/"/g, '""');
+          const rows = db
+            .prepare(
+              `SELECT c.id, c.path, c.start_line, c.end_line,
+                      snippet(chunks_fts, 0, '«', '»', '…', 24) AS hit,
+                      bm25(chunks_fts) AS score
+               FROM chunks_fts
+               JOIN chunks c ON c.id = chunks_fts.id
+               WHERE chunks_fts MATCH ?
+               ORDER BY score
+               LIMIT ?`,
+            )
+            .all(safe, limit) as Array<{
+            id: string;
+            path: string;
+            start_line: number;
+            end_line: number;
+            hit: string;
+            score: number;
+          }>;
+          for (const r of rows) {
+            hits.push({
+              path: r.path,
+              start_line: r.start_line,
+              end_line: r.end_line,
+              snippet: r.hit,
+              score: r.score,
+              source: 'fts',
+            });
+          }
+        } catch (err) {
+          // FTS may fail on malformed queries; non-fatal
+          if (mode === 'fts') throw err;
+        }
+      }
+
+      // ----- Semantic path -----
+      if (mode === 'semantic' || mode === 'hybrid') {
+        const embedding = await embedQueryViaOllama(args.query);
+        if (!embedding) {
+          if (mode === 'semantic') {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `memory_search: semantic mode requires Ollama at ${process.env.OLLAMA_URL || 'http://192.168.1.115:11434'} with nomic-embed-text. Embedding call failed. Falling back to FTS by re-calling with mode="fts".`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        } else {
+          // Load sqlite-vec extension into this connection
+          sqliteVec.load(db);
+          const vectorBuf = Buffer.from(new Float32Array(embedding).buffer);
+          // KNN over the vec0 index. The sqlite-vec virtual table is
+          // "chunks_vec" with a "vector" column. Match rowids back through
+          // chunks_vec_rowids → chunks.id.
+          try {
+            const rows = db
+              .prepare(
+                `SELECT c.id, c.path, c.start_line, c.end_line,
+                        substr(c.text, 1, 240) AS preview,
+                        v.distance AS dist
+                 FROM (
+                   SELECT rowid, distance
+                   FROM chunks_vec
+                   WHERE vector MATCH ?
+                   ORDER BY distance
+                   LIMIT ?
+                 ) v
+                 JOIN chunks_vec_rowids r ON r.rowid = v.rowid
+                 JOIN chunks c ON c.id = r.id`,
+              )
+              .all(vectorBuf, limit) as Array<{
+              id: string;
+              path: string;
+              start_line: number;
+              end_line: number;
+              preview: string;
+              dist: number;
+            }>;
+            for (const r of rows) {
+              // Skip if FTS already returned this exact chunk
+              if (
+                hits.some(
+                  (h) =>
+                    h.path === r.path && h.start_line === r.start_line,
+                )
+              ) {
+                continue;
+              }
+              hits.push({
+                path: r.path,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                snippet: r.preview,
+                score: r.dist,
+                source: 'semantic',
+              });
+            }
+          } catch (err) {
+            // sqlite-vec may not load on all builds; report and continue
+            if (mode === 'semantic') {
+              const msg = err instanceof Error ? err.message : String(err);
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `memory_search semantic failed: ${msg}. The sqlite-vec extension may not be loadable in this container. Use mode="fts".`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+          }
+        }
+      }
+
+      if (hits.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `No matches for: ${args.query} (mode=${mode})`,
+            },
+          ],
+        };
+      }
+
+      // For hybrid: semantic first, then FTS
+      const ordered =
+        mode === 'hybrid'
+          ? [
+              ...hits.filter((h) => h.source === 'semantic'),
+              ...hits.filter((h) => h.source === 'fts'),
+            ]
+          : hits;
+
+      const formatted = ordered
+        .slice(0, limit)
+        .map(
+          (r, i) =>
+            `${i + 1}. [${r.source}] ${r.path}:${r.start_line}-${r.end_line}\n   ${r.snippet.replace(/\n/g, ' ')}`,
+        )
+        .join('\n\n');
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Found ${ordered.length} match${ordered.length === 1 ? '' : 'es'} for "${args.query}" (mode=${mode}):\n\n${formatted}\n\nRead the file with the Read tool for full context.`,
+          },
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `memory_search failed: ${msg}`,
+          },
+        ],
+        isError: true,
+      };
+    } finally {
+      db.close();
+    }
+  },
+);
+
+// usage_report — show recent token usage and approximate cost from the
+// transcript JSONLs the SDK writes per session. Reads from
+// /home/node/.claude/projects/-workspace-group/*.jsonl, which is the standard
+// Claude Code session log path inside the container.
+server.tool(
+  'usage_report',
+  `Report recent token usage and approximate cost across this group's sessions. Use to answer "how much have I spent today" or to debug long sessions. Returns per-session totals and a daily aggregate.`,
+  {
+    days: z
+      .number()
+      .int()
+      .optional()
+      .describe('How many days of history to scan (default 7, max 30).'),
+  },
+  async (args) => {
+    const days = Math.min(Math.max(args.days ?? 7, 1), 30);
+    const projectsDir = '/home/node/.claude/projects';
+    if (!fs.existsSync(projectsDir)) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'usage_report: no project sessions found yet.',
+          },
+        ],
+      };
+    }
+
+    type SessionTotals = {
+      file: string;
+      date: string;
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+    };
+    const totals: SessionTotals[] = [];
+    const cutoff = Date.now() - days * 86400_000;
+
+    function walk(dir: string) {
+      for (const name of fs.readdirSync(dir)) {
+        const full = path.join(dir, name);
+        const st = fs.statSync(full);
+        if (st.isDirectory()) {
+          walk(full);
+        } else if (name.endsWith('.jsonl') && st.mtimeMs >= cutoff) {
+          const t: SessionTotals = {
+            file: name,
+            date: new Date(st.mtimeMs).toISOString().slice(0, 10),
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+          };
+          try {
+            const lines = fs.readFileSync(full, 'utf-8').split('\n');
+            for (const line of lines) {
+              if (!line) continue;
+              try {
+                const ev = JSON.parse(line) as {
+                  message?: { usage?: Record<string, number> };
+                };
+                const u = ev.message?.usage;
+                if (u) {
+                  t.input += u.input_tokens || 0;
+                  t.output += u.output_tokens || 0;
+                  t.cacheRead += u.cache_read_input_tokens || 0;
+                  t.cacheWrite += u.cache_creation_input_tokens || 0;
+                }
+              } catch {
+                // skip malformed lines
+              }
+            }
+          } catch {
+            // skip unreadable files
+          }
+          if (t.input || t.output) totals.push(t);
+        }
+      }
+    }
+
+    try {
+      walk(projectsDir);
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `usage_report failed: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (totals.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `No session usage found in the last ${days} days.`,
+          },
+        ],
+      };
+    }
+
+    // Aggregate per day
+    const byDate = new Map<string, SessionTotals>();
+    for (const t of totals) {
+      const a = byDate.get(t.date) || {
+        file: '',
+        date: t.date,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      };
+      a.input += t.input;
+      a.output += t.output;
+      a.cacheRead += t.cacheRead;
+      a.cacheWrite += t.cacheWrite;
+      byDate.set(t.date, a);
+    }
+
+    // Rough Opus 4.6 pricing (Anthropic pubished rates as of 2026):
+    //   $15 / 1M input, $75 / 1M output, $1.50 / 1M cache read, $18.75 / 1M cache write
+    // These are approximations — actual cost varies by model.
+    function cost(t: {
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+    }) {
+      return (
+        (t.input / 1e6) * 15 +
+        (t.output / 1e6) * 75 +
+        (t.cacheRead / 1e6) * 1.5 +
+        (t.cacheWrite / 1e6) * 18.75
+      );
+    }
+
+    const dates = [...byDate.values()].sort((a, b) =>
+      a.date.localeCompare(b.date),
+    );
+    const lines = dates.map(
+      (d) =>
+        `${d.date}  in:${d.input.toLocaleString().padStart(10)}  out:${d.output.toLocaleString().padStart(8)}  cache:${(d.cacheRead + d.cacheWrite).toLocaleString().padStart(10)}  ~$${cost(d).toFixed(2)}`,
+    );
+
+    const grand = dates.reduce(
+      (acc, d) => ({
+        input: acc.input + d.input,
+        output: acc.output + d.output,
+        cacheRead: acc.cacheRead + d.cacheRead,
+        cacheWrite: acc.cacheWrite + d.cacheWrite,
+      }),
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    );
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text:
+            `Usage over ${days} days (${totals.length} sessions):\n\n` +
+            lines.join('\n') +
+            `\n\nTOTAL  in:${grand.input.toLocaleString()} out:${grand.output.toLocaleString()} cache:${(grand.cacheRead + grand.cacheWrite).toLocaleString()} ~$${cost(grand).toFixed(2)}\n\n(Pricing is approximate Opus 4.6 rates. Actual cost varies by model.)`,
+        },
+      ],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
