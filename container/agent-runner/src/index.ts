@@ -565,7 +565,6 @@ async function runQuery(
         'mcp__github__*',
         'mcp__playwright__*',
         'mcp__gcal__*',
-        'mcp__memgraph__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',

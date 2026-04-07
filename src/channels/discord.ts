@@ -190,7 +190,11 @@ export class DiscordChannel implements Channel {
     });
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+    files?: string[],
+  ): Promise<void> {
     if (!this.client) {
       logger.warn('Discord client not initialized');
       return;
@@ -207,16 +211,36 @@ export class DiscordChannel implements Channel {
 
       const textChannel = channel as TextChannel;
 
-      // Discord has a 2000 character limit per message — split if needed
+      // Discord has a 2000 character limit per message — split if needed.
+      // Attachments only go on the LAST chunk so the file appears next to
+      // the closing text.
       const MAX_LENGTH = 2000;
+      const attachments = (files || []).filter(
+        (f) => typeof f === 'string' && f.length > 0,
+      );
+
       if (text.length <= MAX_LENGTH) {
-        await textChannel.send(text);
+        await textChannel.send({
+          content: text || undefined,
+          files: attachments.length > 0 ? attachments : undefined,
+        });
       } else {
+        const chunks: string[] = [];
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await textChannel.send(text.slice(i, i + MAX_LENGTH));
+          chunks.push(text.slice(i, i + MAX_LENGTH));
+        }
+        for (let i = 0; i < chunks.length; i++) {
+          const isLast = i === chunks.length - 1;
+          await textChannel.send({
+            content: chunks[i],
+            files: isLast && attachments.length > 0 ? attachments : undefined,
+          });
         }
       }
-      logger.info({ jid, length: text.length }, 'Discord message sent');
+      logger.info(
+        { jid, length: text.length, files: attachments.length },
+        'Discord message sent',
+      );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
     }

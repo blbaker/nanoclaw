@@ -11,7 +11,11 @@ import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    files?: string[],
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -81,9 +85,46 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  // Resolve attachment basenames to host paths inside the
+                  // group's IPC files dir. The container previously copied
+                  // these files there via the send_message MCP tool.
+                  const filesDir = path.join(ipcBaseDir, sourceGroup, 'files');
+                  const resolvedFiles: string[] = [];
+                  if (Array.isArray(data.files)) {
+                    for (const f of data.files) {
+                      if (typeof f !== 'string') continue;
+                      // Reject path traversal — basename only
+                      const safe = path.basename(f);
+                      const fullPath = path.join(filesDir, safe);
+                      if (fs.existsSync(fullPath)) {
+                        resolvedFiles.push(fullPath);
+                      } else {
+                        logger.warn(
+                          { sourceGroup, file: safe },
+                          'IPC attachment missing on host',
+                        );
+                      }
+                    }
+                  }
+                  await deps.sendMessage(
+                    data.chatJid,
+                    data.text,
+                    resolvedFiles.length > 0 ? resolvedFiles : undefined,
+                  );
+                  // Cleanup the attachments after a successful send
+                  for (const fp of resolvedFiles) {
+                    try {
+                      fs.unlinkSync(fp);
+                    } catch {
+                      /* ignore */
+                    }
+                  }
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      files: resolvedFiles.length,
+                    },
                     'IPC message sent',
                   );
                 } else {

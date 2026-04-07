@@ -696,8 +696,36 @@ describe('DiscordChannel', () => {
       await channel.sendMessage('dc:1234567890123456', longText);
 
       expect(mockChannel.send).toHaveBeenCalledTimes(2);
-      expect(mockChannel.send).toHaveBeenNthCalledWith(1, 'x'.repeat(2000));
-      expect(mockChannel.send).toHaveBeenNthCalledWith(2, 'x'.repeat(1000));
+      expect(mockChannel.send).toHaveBeenNthCalledWith(1, {
+        content: 'x'.repeat(2000),
+        files: undefined,
+      });
+      expect(mockChannel.send).toHaveBeenNthCalledWith(2, {
+        content: 'x'.repeat(1000),
+        files: undefined,
+      });
+    });
+
+    it('attaches files on the last chunk', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendMessage('dc:1234567890123456', 'Hi', [
+        '/tmp/screenshot.png',
+      ]);
+
+      expect(mockChannel.send).toHaveBeenCalledTimes(1);
+      expect(mockChannel.send).toHaveBeenCalledWith({
+        content: 'Hi',
+        files: ['/tmp/screenshot.png'],
+      });
     });
   });
 

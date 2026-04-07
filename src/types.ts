@@ -87,7 +87,10 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  // Send a message. Optional `files` are absolute host paths to attachments
+  // (images, video, audio, documents) — channels that support attachments
+  // upload them inline; channels that don't fall back to text only.
+  sendMessage(jid: string, text: string, files?: string[]): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

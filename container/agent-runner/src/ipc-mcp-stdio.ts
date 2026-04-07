@@ -14,6 +14,7 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const FILES_DIR = path.join(IPC_DIR, 'files');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -39,11 +40,40 @@ const server = new McpServer({
   version: '1.0.0',
 });
 
+// Stage a file for delivery by copying it into /workspace/ipc/files/ with a
+// unique basename. Returns the basename which the host's IPC processor will
+// resolve back to a real host path for the channel adapter.
+function stageAttachment(srcPath: string): string | null {
+  if (typeof srcPath !== 'string' || srcPath.length === 0) return null;
+  if (!fs.existsSync(srcPath)) return null;
+  try {
+    const st = fs.statSync(srcPath);
+    if (!st.isFile()) return null;
+    // Hard limit to avoid sending massive files. Discord max upload is 25MB
+    // for free, 50MB for level 2 boost; we cap at 25MB to be safe.
+    const MAX_BYTES = 25 * 1024 * 1024;
+    if (st.size > MAX_BYTES) return null;
+    fs.mkdirSync(FILES_DIR, { recursive: true });
+    const basename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(srcPath)}`;
+    const dst = path.join(FILES_DIR, basename);
+    fs.copyFileSync(srcPath, dst);
+    return basename;
+  } catch {
+    return null;
+  }
+}
+
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. Optional `files` lets you attach images, video, audio, or documents — pass absolute paths inside the container (e.g. /tmp/screenshot.png from playwright, or /workspace/group/output/chart.png). Files >25MB are rejected. You can call this multiple times.",
   {
     text: z.string().describe('The message text to send'),
+    files: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Optional absolute file paths to attach. Examples: ["/tmp/screenshot.png"], ["/workspace/group/foo.mp4"]. Max 25MB per file. Channels that support attachments (Discord) upload them; channels that do not fall back to text only.',
+      ),
     sender: z
       .string()
       .optional()
@@ -52,18 +82,40 @@ server.tool(
       ),
   },
   async (args) => {
-    const data: Record<string, string | undefined> = {
+    const stagedFiles: string[] = [];
+    const failedFiles: string[] = [];
+    if (Array.isArray(args.files)) {
+      for (const f of args.files) {
+        const basename = stageAttachment(f);
+        if (basename) {
+          stagedFiles.push(basename);
+        } else {
+          failedFiles.push(f);
+        }
+      }
+    }
+
+    const data: Record<string, unknown> = {
       type: 'message',
       chatJid,
       text: args.text,
       sender: args.sender || undefined,
       groupFolder,
+      files: stagedFiles.length > 0 ? stagedFiles : undefined,
       timestamp: new Date().toISOString(),
     };
 
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+    let report = `Message sent.`;
+    if (stagedFiles.length > 0) {
+      report += ` Attached ${stagedFiles.length} file${stagedFiles.length === 1 ? '' : 's'}.`;
+    }
+    if (failedFiles.length > 0) {
+      report += ` Failed to attach (missing or >25MB): ${failedFiles.join(', ')}.`;
+    }
+
+    return { content: [{ type: 'text' as const, text: report }] };
   },
 );
 
