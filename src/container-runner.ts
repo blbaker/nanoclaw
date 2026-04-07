@@ -252,6 +252,21 @@ async function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Pass user-defined secrets via --env-file. data/env/env is the user's
+  // explicit container env file (separate from .env which is shadowed). Used
+  // for things like NOTION_API_KEY that the in-container Notion MCP server
+  // needs to read from process.env, plus reference URLs/tokens for external
+  // services the agent talks to (HA, Tandoor, Linear, market data, etc.).
+  const containerEnvFile = path.join(
+    process.cwd(),
+    'data',
+    'env',
+    'env',
+  );
+  if (fs.existsSync(containerEnvFile)) {
+    args.push('--env-file', containerEnvFile);
+  }
+
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
   const onecliApplied = await onecli.applyContainerConfig(args, {

@@ -435,9 +435,28 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Optional Notion MCP server — only enabled if NOTION_API_KEY is present in
+  // the container env (injected by OneCLI or passed through from .env).
+  const notionApiKey = process.env.NOTION_API_KEY;
+  const extraMcpServers: Record<string, {
+    command: string;
+    args: string[];
+    env: Record<string, string>;
+  }> = {};
+  if (notionApiKey) {
+    extraMcpServers.notion = {
+      command: 'npx',
+      args: ['-y', '@notionhq/notion-mcp-server'],
+      env: { NOTION_API_KEY: notionApiKey },
+    };
+    log('Notion MCP server enabled');
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
+      model: 'claude-opus-4-6',
+      maxThinkingTokens: 10000,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -469,6 +488,7 @@ async function runQuery(
         'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
+        'mcp__notion__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -484,6 +504,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...extraMcpServers,
       },
       hooks: {
         PreCompact: [
