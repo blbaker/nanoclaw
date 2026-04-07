@@ -257,12 +257,7 @@ async function buildContainerArgs(
   // for things like NOTION_API_KEY that the in-container Notion MCP server
   // needs to read from process.env, plus reference URLs/tokens for external
   // services the agent talks to (HA, Tandoor, Linear, market data, etc.).
-  const containerEnvFile = path.join(
-    process.cwd(),
-    'data',
-    'env',
-    'env',
-  );
+  const containerEnvFile = path.join(process.cwd(), 'data', 'env', 'env');
   if (fs.existsSync(containerEnvFile)) {
     args.push('--env-file', containerEnvFile);
   }
