@@ -186,9 +186,13 @@ async function runTask(
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
+          // Capture the result for logging/run history but DO NOT auto-post
+          // it to the channel. Scheduled tasks are silent by default — the
+          // agent must explicitly call mcp__nanoclaw__send_message to talk
+          // back, which routes through the IPC path. This is the NanoClaw
+          // pattern; the OpenClaw pattern of "every cron output → channel
+          // → return NO_REPLY to suppress" is gone.
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
