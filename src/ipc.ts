@@ -8,6 +8,7 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { isNoReplySentinel } from './router.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -108,27 +109,48 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       }
                     }
                   }
-                  await deps.sendMessage(
-                    data.chatJid,
-                    data.text,
-                    resolvedFiles.length > 0 ? resolvedFiles : undefined,
-                  );
-                  // Cleanup the attachments after a successful send
-                  for (const fp of resolvedFiles) {
-                    try {
-                      fs.unlinkSync(fp);
-                    } catch {
-                      /* ignore */
+                  // Suppress NO_REPLY sentinel — agents (especially cron
+                  // tasks) sometimes call send_message("NO_REPLY") instead of
+                  // returning the sentinel as their final result. Without
+                  // this check the literal "NO_REPLY" lands in Discord.
+                  // The check covers the IPC path; the streaming path has
+                  // its own check in src/index.ts. Both paths share the
+                  // helper isNoReplySentinel from router.ts.
+                  if (
+                    isNoReplySentinel(data.text) &&
+                    resolvedFiles.length === 0
+                  ) {
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        sentinel: data.text.trim(),
+                      },
+                      'IPC message suppressed (NO_REPLY sentinel)',
+                    );
+                  } else {
+                    await deps.sendMessage(
+                      data.chatJid,
+                      data.text,
+                      resolvedFiles.length > 0 ? resolvedFiles : undefined,
+                    );
+                    // Cleanup the attachments after a successful send
+                    for (const fp of resolvedFiles) {
+                      try {
+                        fs.unlinkSync(fp);
+                      } catch {
+                        /* ignore */
+                      }
                     }
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        files: resolvedFiles.length,
+                      },
+                      'IPC message sent',
+                    );
                   }
-                  logger.info(
-                    {
-                      chatJid: data.chatJid,
-                      sourceGroup,
-                      files: resolvedFiles.length,
-                    },
-                    'IPC message sent',
-                  );
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },

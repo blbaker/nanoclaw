@@ -35,6 +35,41 @@ export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
 
+/**
+ * NO_REPLY sentinel detection.
+ *
+ * Cron tasks and persona prompts use the literal text "NO_REPLY" to mean
+ * "I checked, nothing to report — say nothing". This must be intercepted
+ * BEFORE the message reaches Discord, in EVERY path that calls
+ * channel.sendMessage:
+ *
+ *   1. Streaming result path  (src/index.ts processGroupMessages → onOutput)
+ *   2. IPC message path       (src/ipc.ts when agent calls send_message MCP tool)
+ *   3. Any future path that does outbound delivery
+ *
+ * If you add a new outbound path, call this helper before sending.
+ *
+ * Matches case-insensitively, with optional surrounding whitespace,
+ * underscores/hyphens/spaces inside, optional parentheses, optional
+ * trailing period. All of these suppress:
+ *   - "NO_REPLY"
+ *   - "no_reply"
+ *   - "NO REPLY"
+ *   - "no-reply"
+ *   - "NOREPLY"
+ *   - "(NO_REPLY)"
+ *   - "NO_REPLY."
+ *   - "  NO_REPLY  "
+ *
+ * Does NOT match if the sentinel is embedded in a longer message
+ * (e.g. "Result: NO_REPLY") — those are treated as legitimate replies
+ * because the agent went out of its way to wrap them.
+ */
+export function isNoReplySentinel(text: string): boolean {
+  if (!text) return false;
+  return /^\s*\(?\s*NO[\s_-]*REPLY\s*\)?\.?\s*$/i.test(text);
+}
+
 export function formatOutbound(rawText: string): string {
   const text = stripInternalTags(rawText);
   if (!text) return '';

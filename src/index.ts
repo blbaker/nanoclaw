@@ -53,7 +53,12 @@ import {
   resolveGroupFilesPath,
 } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  isNoReplySentinel,
+} from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -319,11 +324,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 
-      // NO_REPLY sentinel — when a scheduled task or persona returns the
-      // literal text "NO_REPLY" (or just "no reply"), suppress the message
-      // entirely. This is the OpenClaw-era convention used by cron jobs to
-      // mean "I checked, nothing to report — say nothing".
-      const isNoReply = /^NO[_-]REPLY\s*$/i.test(text);
+      // NO_REPLY sentinel — see router.ts isNoReplySentinel for the matcher.
+      // Cron tasks and persona prompts use this to mean "I checked, nothing
+      // to report — say nothing". The same helper is used by the IPC path
+      // in src/ipc.ts so both delivery routes are covered.
+      const isNoReply = isNoReplySentinel(text);
 
       logger.info(
         {
